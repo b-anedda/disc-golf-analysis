@@ -117,9 +117,13 @@ class DiscAnalyzer:
         accel_params = self._analyze_acceleration_phase(positions_early, speeds_early)
         results.update(accel_params)
         
-        # Wobble analysis during early phase
-        wobble_amp = self._calculate_roll_angle_range(rotations_early)
-        results['wobble_amplitude'] = wobble_amp
+        # Wobble analysis during early phase (RMS and range)
+        wobble_res = self._calculate_roll_angle_range(rotations_early)
+        if isinstance(wobble_res, tuple) and len(wobble_res) == 2:
+            results['wobble_amplitude'] = wobble_res[0]  # RMS
+            results['wobble_range'] = wobble_res[1]
+        else:
+            results['wobble_amplitude'] = wobble_res
         
         # Release position
         results['release_z_position'] = positions_early[0, 2]
@@ -245,76 +249,112 @@ class DiscAnalyzer:
             'launch_angle': None,
             'nose_angle': None,
             'spin_rate_evolution': None,
+            'release_frame': None,
         }
         
         try:
-            # Clamp release frame to valid range
-            release_idx = min(release_frame, len(velocities) - 1)
-            
-            # (1) DISC SPEED: Disc velocity at release
-            if len(velocities) > release_idx:
-                release_speed = np.linalg.norm(velocities[release_idx])
-                # Convert from mm/s to km/h: multiply by 3.6 / 1000 = 0.0036
-                results['disc_speed'] = release_speed * 0.0036
-            
-            # Get release rotation matrix and velocity
-            R_release = rotations[release_idx]
-            v_release = velocities[release_idx] if release_idx < len(velocities) else None
-            
-            if v_release is None:
-                return results
-            
-            # (2) SPIN: Spin rate around z-axis at release
-            # Spin is rotation rate around disc's z-axis
-            if release_idx > 0 and release_idx < len(rotations):
-                R_dot = (rotations[release_idx] - rotations[release_idx-1]) / self.dt
-                skew = R_dot @ R_release.T
-                omega_z = skew[1, 0]
-                # Convert rad/s to RPM: RPM = (rad/s) * 60 / (2*pi)
-                results['spin'] = abs(omega_z) * 60.0 / (2.0 * np.pi)
-            
-            # (3) HYZER ANGLE: Roll angle (banking) at release
-            hyzer_rad = np.arctan2(R_release[2, 1], R_release[2, 2])
-            results['hyzer_angle'] = np.degrees(hyzer_rad)
-            
-            # (4) LAUNCH ANGLE: Vertical angle of velocity vector at release
-            launch_rad = np.arctan2(v_release[2], v_release[0])
-            results['launch_angle'] = np.degrees(launch_rad)
-            
-            # (5) NOSE ANGLE: Alignment of disc nose with velocity at release
-            disc_nose_zx = np.array([R_release[0, 0], R_release[2, 0]])
-            velocity_zx = np.array([v_release[0], v_release[2]])
-            
-            disc_nose_zx_norm = disc_nose_zx / (np.linalg.norm(disc_nose_zx) + 1e-6)
-            velocity_zx_norm = velocity_zx / (np.linalg.norm(velocity_zx) + 1e-6)
-            
-            cos_angle = np.dot(disc_nose_zx_norm, velocity_zx_norm)
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            nose_rad = np.arccos(cos_angle)
-            
-            cross_z = disc_nose_zx_norm[0] * velocity_zx_norm[1] - disc_nose_zx_norm[1] * velocity_zx_norm[0]
-            if cross_z < 0:
-                nose_rad = -nose_rad
-            
-            results['nose_angle'] = np.degrees(nose_rad)
-            
-            # Spin evolution: change in spin over early phase
+            # Use an averaging window of the first N frames after release
+            window_size = 10
+
+            # Clamp release frame to valid range (index into velocities)
+            release_idx = min(release_frame, max(0, len(velocities) - 1))
+
+            # Define window over velocities: start (inclusive) -> end (exclusive)
+            start_idx = release_idx
+            end_idx = min(len(velocities), release_idx + window_size)
+
+            if start_idx >= end_idx:
+                # Not enough data to form a window; fallback to single-frame at release_idx
+                if len(velocities) == 0:
+                    return results
+                start_idx = release_idx
+                end_idx = release_idx + 1
+
+            # Mean velocity vector across the window
+            vel_window = velocities[start_idx:end_idx]
+            mean_vel = np.mean(vel_window, axis=0)
+            results['disc_speed'] = float(np.linalg.norm(mean_vel) * 0.0036)
+
+            # Rotation matrices corresponding to the velocity indices: use rotations[start_idx:end_idx]
+            rot_window = rotations[start_idx:end_idx]
+
+            # (2) SPIN: average spin rate (z-axis) across window
+            omega_z_list = []
+            for i in range(start_idx, end_idx):
+                if i > 0 and i < len(rotations):
+                    R_dot = (rotations[i] - rotations[i-1]) / self.dt
+                    skew = R_dot @ rotations[i].T
+                    omega_z = skew[1, 0]
+                    omega_z_list.append(abs(omega_z))
+
+            if omega_z_list:
+                mean_omega = np.mean(omega_z_list)
+                results['spin'] = float(mean_omega * 60.0 / (2.0 * np.pi))
+
+            # (3) HYZER ANGLE: average roll/bank across window
+            roll_angles = []
+            for R in rot_window:
+                roll_rad = np.arctan2(R[2, 1], R[2, 2])
+                roll_angles.append(np.degrees(roll_rad))
+            if roll_angles:
+                results['hyzer_angle'] = float(np.mean(roll_angles))
+
+            # (4) LAUNCH ANGLE: compute from position delta in global X-Z plane
+            # Use disc position at release and 10 frames later to form a displacement
+            # and compute the angle in the global x-z plane (arctan2(dz, dx)).
+            try:
+                pos_count = len(positions)
+                # Map release index in velocities to position index (velocities[i] is positions[i]->positions[i+1])
+                pos_release_idx = min(release_idx, max(0, pos_count - 1))
+                # Record the release frame index relative to the positions array
+                results['release_frame'] = int(pos_release_idx)
+                pos_later_idx = min(pos_release_idx + window_size, pos_count - 1)
+
+                pos_release = positions[pos_release_idx]
+                pos_later = positions[pos_later_idx]
+                delta_pos = pos_later - pos_release
+
+                launch_rad = np.arctan2(delta_pos[2], delta_pos[0])
+                results['launch_angle'] = float(np.degrees(launch_rad))
+            except Exception:
+                # Fallback to mean velocity method if positions unavailable
+                launch_rad = np.arctan2(mean_vel[2], mean_vel[0])
+                results['launch_angle'] = float(np.degrees(launch_rad))
+
+            # (5) NOSE ANGLE: angle of attack = angle between velocity and disc plane
+            # Disc plane normal is the disc's local Z-axis (third column of R).
+            if len(rot_window) > 0:
+                disc_normals = np.array([R[:, 2] for R in rot_window])
+                mean_normal = np.mean(disc_normals, axis=0)
+
+                # Normalize vectors
+                mean_normal_norm = mean_normal / (np.linalg.norm(mean_normal) + 1e-12)
+                mean_vel_norm = mean_vel / (np.linalg.norm(mean_vel) + 1e-12)
+
+                # Angle between velocity and disc plane = arcsin( dot(mean_normal, mean_vel) )
+                dot_n = np.dot(mean_normal_norm, mean_vel_norm)
+                dot_n = np.clip(dot_n, -1.0, 1.0)
+                nose_rad = np.arcsin(dot_n)
+                results['nose_angle'] = float(np.degrees(nose_rad))
+
+            # Spin evolution: change in spin over the early phase (look-ahead up to window_size)
             if len(rotations) > 1:
                 spin_rates = []
-                for i in range(1, min(len(rotations), release_idx + 10)):  # Look ahead a bit
+                look_ahead_end = min(len(rotations), release_idx + window_size)
+                for i in range(1, look_ahead_end):
                     R_dot = (rotations[i] - rotations[i-1]) / self.dt
                     skew = R_dot @ rotations[i].T
                     omega_z = skew[1, 0]
                     spin_rpm = abs(omega_z) * 60.0 / (2.0 * np.pi)
                     spin_rates.append(spin_rpm)
-                
+
                 if len(spin_rates) > 1:
                     results['spin_rate_evolution'] = spin_rates[-1] - spin_rates[0]
-            
+
             return results
-            
-        except Exception as e:
-            print(f"Error calculating release parameters: {e}")
+
+        except Exception:
+            # Silent failure: return partial results
             return results
     
     def _analyze_acceleration_phase(
@@ -364,37 +404,60 @@ class DiscAnalyzer:
     
     def _calculate_roll_angle_range(self, rotations: np.ndarray) -> Optional[float]:
         """
-        Calculate the range of roll angle (hyzer/banking) during flight.
-        
-        This measures how much the disc's banking angle changes from release to landing,
-        calculated as the angle between the disc's x-y plane and global x-y plane,
-        measured in the global z-y plane.
-        
+        Compute wobble metrics from the sequence of rotation matrices.
+
+        Returns the RMS deviation and the range (max-min) of the instantaneous
+        spin-axis angles (degrees) relative to the mean spin axis. This provides
+        a robust measure of spin-axis variation (wobble) during the analyzed
+        window.
+
         Args:
             rotations: Rotation matrix array (num_frames, 3, 3)
-            
+
         Returns:
-            Range of roll angle in degrees (max - min)
+            Tuple (rms_deviation_deg, range_deg) or None on failure.
         """
         try:
             if len(rotations) < 2:
                 return None
-            
-            # Extract roll angle (hyzer) from each rotation matrix
-            # Roll/hyzer = arctan2(R[2,1], R[2,2])
-            roll_angles = []
-            for rotation in rotations:
-                roll_rad = np.arctan2(rotation[2, 1], rotation[2, 2])
-                roll_deg = np.degrees(roll_rad)
-                roll_angles.append(roll_deg)
-            
-            roll_angles = np.array(roll_angles)
-            
-            # Calculate range of motion (max - min)
-            angle_range = np.max(roll_angles) - np.min(roll_angles)
-            
-            return angle_range
-            
+
+            # Compute the spin axis (local Z) for each rotation matrix in global coords
+            spin_axes = []
+            for R in rotations:
+                if np.isnan(R).any():
+                    continue
+                axis = R[:, 2]
+                norm = np.linalg.norm(axis)
+                if norm <= 1e-12:
+                    continue
+                spin_axes.append(axis / norm)
+
+            if not spin_axes:
+                return None
+
+            spin_axes = np.array(spin_axes)
+
+            # Mean spin axis
+            mean_axis = np.mean(spin_axes, axis=0)
+            mean_axis = mean_axis / (np.linalg.norm(mean_axis) + 1e-12)
+
+            # Angles between each instantaneous spin axis and the mean axis
+            angles_deg = []
+            for a in spin_axes:
+                dot = np.clip(np.dot(a, mean_axis), -1.0, 1.0)
+                angle_rad = np.arccos(dot)
+                angles_deg.append(np.degrees(angle_rad))
+
+            angles_deg = np.array(angles_deg)
+
+            # RMS deviation (degrees)
+            rms = float(np.sqrt(np.mean(angles_deg**2)))
+            # Range (max - min) as complementary metric
+            rng = float(np.max(angles_deg) - np.min(angles_deg))
+
+            # Return RMS (primary) and range as tuple
+            return rms, rng
+
         except Exception:
             return None
     
