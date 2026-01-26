@@ -1,210 +1,57 @@
-"""Load and parse QTM motion capture data for disc golf analysis."""
+"""Load and parse exported QTM JSON motion-capture data (JSON-only).
 
-from typing import Dict, List, Tuple, Optional
+This simplified loader intentionally drops live QTM REST/API support and
+focuses on reading exported QTM JSON files. The older QTM API methods have
+been disabled to avoid depending on QTM internals or network plugins.
+"""
+
+from typing import Dict, List, Optional
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class QTMLoader:
-    """Interface to load and extract 6DOF rigid body data from QTM scripting API."""
-    
+    """JSON-only loader for QTM exported 6DOF rigid-body data.
+
+    Use `load_from_json()` to populate `self.body_data` and then
+    `extract_disc_data()` to retrieve the position/rotation/residual arrays.
+    """
+
     def __init__(self):
-        """Initialize QTM loader."""
         self.body_data: Optional[Dict[str, np.ndarray]] = None
         self.frame_rate: Optional[float] = None
         self.sample_count: Optional[int] = None
-        self.body_name: str = 'Discgolf_Midrange_Hex'  # 6DOF rigid body name
-        
+        self.body_name: str = 'Discgolf_Midrange_Hex'
+
+    # --- Deprecated / disabled QTM API methods ---
     def connect_to_qtm(self) -> bool:
-        """
-        Connect to QTM application via REST API.
-        
-        This uses QTM's scripting REST API to fetch data without needing the Python console.
-        Make sure QTM is running and has a measurement loaded.
-        
-        Returns:
-            bool: True if connection successful, False otherwise.
-        """
-        try:
-            import requests
-        except ImportError:
-            print("Error: requests library not installed")
-            print("Install with: pip install requests")
-            return False
-        
-        # QTM REST API is on port 7979 via /api/scripting/qtm/...
-        base_url = "http://localhost:7979/api/scripting/qtm"
-        
-        try:
-            # Test connection to data/series/_6d endpoint (will be empty if no measurement loaded)
-            response = requests.get(f"{base_url}/data/series/_6d", timeout=2)
-            if response.status_code == 200:
-                self.rest_api_url = base_url
-                self.requests = requests
-                print(f"   [OK] Connected to QTM REST API at {base_url}")
-                return True
-        except Exception as e:
-            pass
-        
-        print("Error: Could not connect to QTM REST API")
-        print("Make sure:")
-        print("  1. QTM application is running")
-        print("  2. A measurement is loaded in QTM (File > Load > select .qtm file)")
-        print("  3. REST API is enabled (Tools > Options > REST API)")
-        print("  4. The disc 6DOF body exists in your AIM model")
+        logger.warning('QTM REST/API support disabled in JSON-only loader')
         return False
-    
+
     def load_measurement(self, measurement_path: str) -> bool:
-        """
-        Load a QTM measurement file (.qtm).
-        
-        Note: Direct loading of .qtm files requires access to QTM's scripting API,
-        which is only available when running through QTM's Python interface or 
-        REST API.
-        
-        Args:
-            measurement_path: Path to .qtm measurement file
-            
-        Returns:
-            bool: True if successful
-        """
-        print(f"\nAttempting to load: {measurement_path}")
-        print("\nNOTE: To load .qtm files, use one of these methods:")
-        print()
-        print("METHOD 1: Use QTM's Python Scripting Console (Recommended)")
-        print("  1. Open QTM application")
-        print("  2. Tools → Python Console")
-        print("  3. Paste and run this code:")
-        print(f"""
-from src.qtm_loader import QTMLoader
-from src.throw_analysis import DiscAnalyzer
-
-loader = QTMLoader()
-loader.load_measurement("{measurement_path}")
-body_data = loader.extract_disc_data()
-
-analyzer = DiscAnalyzer(frame_rate=240.0)
-results = analyzer.analyze_disc_trajectory(body_data)
-print("Disc Speed:", results['disc_speed'])
-print("Spin Rate:", results['spin'])
-# ... etc
-""")
-        print()
-        print("METHOD 2: Export from QTM and Load Exported Data")
-        print("  1. In QTM: Open your measurement")
-        print("  2. File → Export → Rigid Body 6DOF (TSV format)")
-        print("  3. Run: loader.load_from_exported_file('exported_data.tsv')")
-        print()
-        
+        logger.warning('Direct .qtm loading is disabled; use load_from_json()')
         return False
-    
+
     def load_project(self, project_path: str) -> bool:
-        """
-        Load a QTM project file.
-        
-        Args:
-            project_path: Path to .qtmproj file
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            import qtm.file as qtm_file
-            qtm_file.open(project_path)
-            return True
-        except Exception as e:
-            print(f"Error loading project: {e}")
-            return False
-    
+        logger.warning('Project loading disabled in JSON-only loader')
+        return False
+
     def get_available_bodies(self) -> List[str]:
-        """
-        Get list of all available rigid bodies in current measurement.
-        
-        Returns:
-            List of rigid body names
-        """
-        try:
-            from qtm.data.object import body
-            bodies = body.get_all_bodies()
-            return [b['name'] for b in bodies] if bodies else []
-        except Exception as e:
-            print(f"Error getting bodies: {e}")
-            return []
-    
+        logger.warning('get_available_bodies: QTM API disabled')
+        return []
+
+    # Keep extract_rigid_body_6dof but restrict to already-loaded JSON data
     def extract_rigid_body_6dof(self, body_name: Optional[str] = None) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Extract 6DOF rigid body data (position + rotation matrix).
-        
-        Works with:
-        1. Pre-loaded JSON data (self.body_data)
-        2. QTM REST API
-        3. Direct QTM API (if available)
-        
-        Args:
-            body_name: Name of the rigid body. Defaults to 'Discgolf_Midrange_Hex'
-            
-        Returns:
-            Dictionary with keys:
-            - 'position': array of shape (num_frames, 3) - XYZ positions in mm
-            - 'rotation': array of shape (num_frames, 3, 3) - rotation matrices
-            - 'residual': array of shape (num_frames,) - model fit residuals
-        """
         if body_name is None:
             body_name = self.body_name
-        
-        # If data already loaded from JSON, return it
+
         if self.body_data is not None:
             return self.body_data
-        
-        # Try REST API
-        if hasattr(self, 'rest_api_url') and hasattr(self, 'requests'):
-            return self._extract_6dof_rest_api(body_name)
-        
-        # Fall back to direct API
-        try:
-            from qtm.data.object import body as qtm_body
-            from qtm.data.series import rigid_body
-            
-            # Find body by name
-            body_id = qtm_body.find_body(body_name)
-            if body_id is None:
-                print(f"Body '{body_name}' not found.")
-                return None
-            
-            # Get sample count
-            num_samples = rigid_body.get_sample_count(body_id)
-            self.sample_count = num_samples
-            
-            # Extract all 6DOF samples
-            positions = []
-            rotations = []
-            residuals = []
-            
-            for frame in range(num_samples):
-                sample = rigid_body.get_sample(body_id, frame)
-                if sample:
-                    pos = sample.get('position', [np.nan, np.nan, np.nan])
-                    positions.append(pos)
-                    
-                    rot = sample.get('rotation', np.eye(3))
-                    rotations.append(rot)
-                    
-                    res = sample.get('residual', np.nan)
-                    residuals.append(res)
-                else:
-                    positions.append([np.nan, np.nan, np.nan])
-                    rotations.append(np.full((3, 3), np.nan))
-                    residuals.append(np.nan)
-            
-            self.body_data = {
-                'position': np.array(positions),
-                'rotation': np.array(rotations),
-                'residual': np.array(residuals)
-            }
-            return self.body_data
-            
-        except Exception as e:
-            print(f"Error extracting rigid body '{body_name}': {e}")
-            return None
+
+        logger.error('No JSON data loaded; call load_from_json() first')
+        return None
     
     def _extract_6dof_rest_api(self, body_name: str) -> Optional[Dict[str, np.ndarray]]:
         """
@@ -382,18 +229,16 @@ print("Spin Rate:", results['spin'])
             
             return np.array([np.degrees(yaw), np.degrees(pitch), np.degrees(roll)])
         except Exception as e:
-            print(f"Error converting rotation matrix: {e}")
+            logger.exception("Error converting rotation matrix: %s", e)
             return np.array([np.nan, np.nan, np.nan])
     
     def get_frame_rate(self) -> Optional[float]:
         """Get frame rate of the measurement in Hz."""
         try:
-            import qtm
-            fr = qtm.settings.processing.get_frequency()
-            self.frame_rate = float(fr)
-            return self.frame_rate
-        except Exception as e:
-            print(f"Error getting frame rate: {e}")
+            # QTM API not supported in JSON-only loader
+            logger.warning('get_frame_rate: QTM API not available in JSON-only loader')
+            return None
+        except Exception:
             return None
     
     def calculate_velocity(self, positions: np.ndarray) -> np.ndarray:
@@ -407,11 +252,9 @@ print("Spin Rate:", results['spin'])
             Array of shape (num_frames-1, 3) with velocity vectors
         """
         if self.frame_rate is None:
-            self.get_frame_rate()
-        
-        if self.frame_rate is None:
-            print("Warning: Frame rate unknown, using 1.0 Hz")
-            self.frame_rate = 1.0
+            # If frame_rate wasn't set by JSON, default to 240 Hz common for high-speed
+            logger.info('Frame rate unknown, defaulting to 240 Hz')
+            self.frame_rate = 240.0
         
         # Filter out NaN values for derivative calculation
         dt = 1.0 / self.frame_rate
@@ -448,21 +291,21 @@ print("Spin Rate:", results['spin'])
         
         if body_name is None:
             body_name = self.body_name
-        
+
         json_path = Path(json_file)
         if not json_path.exists():
-            print(f"✗ JSON file not found: {json_path}")
+            logger.error('JSON file not found: %s', json_path)
             return False
-        
+
         try:
-            print(f"Loading from JSON: {json_path.name}")
+            logger.info('Loading from JSON: %s', json_path.name)
             with open(json_path, 'r') as f:
                 data = json.load(f)
-            
+
             # Extract frame rate
             if 'Timebase' in data and 'Frequency' in data['Timebase']:
                 self.frame_rate = float(data['Timebase']['Frequency'])
-                print(f"  Frame rate: {self.frame_rate} Hz")
+                logger.info('Frame rate: %s Hz', self.frame_rate)
             
             # Find rigid body
             rigid_bodies = data.get('RigidBodies', [])
@@ -473,9 +316,9 @@ print("Spin Rate:", results['spin'])
                     break
             
             if body is None:
-                print(f"✗ Body '{body_name}' not found in JSON")
+                logger.error("Body '%s' not found in JSON", body_name)
                 available = [rb.get('Name', 'Unknown') for rb in rigid_bodies]
-                print(f"  Available bodies: {available}")
+                logger.info('Available bodies: %s', available)
                 return False
             
             # Extract position, rotation, residual from all parts
@@ -514,7 +357,7 @@ print("Spin Rate:", results['spin'])
                     residuals.append(residual)
             
             if not positions:
-                print(f"✗ No frame data found for body '{body_name}'")
+                logger.error("No frame data found for body '%s'", body_name)
                 return False
             
             self.body_data = {
@@ -523,14 +366,12 @@ print("Spin Rate:", results['spin'])
                 'residual': np.array(residuals)
             }
             self.sample_count = len(positions)
-            
-            print(f"  ✓ Loaded {self.sample_count} frames")
-            print(f"  Position shape: {self.body_data['position'].shape}")
-            print(f"  Rotation shape: {self.body_data['rotation'].shape}")
+
+            logger.info('Loaded %d frames', self.sample_count)
+            logger.debug('Position shape: %s', self.body_data['position'].shape)
+            logger.debug('Rotation shape: %s', self.body_data['rotation'].shape)
             return True
             
         except Exception as e:
-            print(f"✗ Error loading JSON: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception('Error loading JSON: %s', e)
             return False
