@@ -32,7 +32,15 @@ class DiscGolfAnalysisApp(QMainWindow):
         self.current_throw_name = "Unknown"
         
         self.init_ui()
-        
+        # On start, ask for a folder to watch for JSON exports
+        QTimer.singleShot(100, self.select_folder_on_start)
+
+        # Files already processed
+        self.processed_files = set()
+        # Poll timer for new files
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(2000)
+        self.poll_timer.timeout.connect(self.poll_folder)
     def init_ui(self):
         """Initialize user interface."""
         self.setWindowTitle("Disc Golf Throw Analysis")
@@ -51,6 +59,10 @@ class DiscGolfAnalysisApp(QMainWindow):
         load_btn = QPushButton("Load QTM Project")
         load_btn.clicked.connect(self.load_project)
         control_layout.addWidget(load_btn)
+
+        folder_btn = QPushButton("Select Session Folder")
+        folder_btn.clicked.connect(self.select_folder_dialog)
+        control_layout.addWidget(folder_btn)
         
         load_data_btn = QPushButton("Load Throw Data")
         load_data_btn.clicked.connect(self.load_throw_data)
@@ -86,6 +98,10 @@ class DiscGolfAnalysisApp(QMainWindow):
         
         self.summary_plot = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
         self.tabs.addTab(self.summary_plot, "Analysis Summary")
+        
+        # Add Inspector tab for velocity/accel and key metrics
+        self.inspector_plot = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
+        self.tabs.addTab(self.inspector_plot, "Inspector")
         
         layout.addWidget(self.tabs)
         
@@ -126,8 +142,9 @@ class DiscGolfAnalysisApp(QMainWindow):
         
         try:
             # Try to load from QTM if available
-            if hasattr(self.qtm_loader, 'connect_to_qtm') and self.qtm_loader.connect_to_qtm():
-                self.body_data = self.qtm_loader.extract_disc_data()
+            if hasattr(self.qtm_loader, 'load_from_json') and self.selected_folder:
+                # No-op: using folder polling to load JSON files
+                pass
             else:
                 # Generate synthetic 6DOF data for demonstration
                 self.generate_synthetic_body_data(throw_name)
@@ -230,8 +247,8 @@ class DiscGolfAnalysisApp(QMainWindow):
         positions = self.body_data['position']
         rotations = self.body_data['rotation']
         
-        # 3D Trajectory - just body center of mass path
-        fig = self._plot_body_trajectory_3d(positions, self.current_throw_name)
+        # 3D Trajectory - body center of mass path with start and release markers
+        fig = self._plot_body_trajectory_3d(positions, disc_analysis.get('release_frame'), self.current_throw_name)
         self.trajectory_3d.figure = fig
         self.trajectory_3d.draw()
         
@@ -251,19 +268,32 @@ class DiscGolfAnalysisApp(QMainWindow):
         self.summary_plot.draw()
     
     @staticmethod
-    def _plot_body_trajectory_3d(positions: np.ndarray, title: str) -> Figure:
-        """Plot 3D body trajectory."""
+    def _plot_body_trajectory_3d(positions: np.ndarray, release_frame: int = None, title: str = "") -> Figure:
+        """Plot 3D body trajectory with start, release and landing markers.
+
+        Args:
+            positions: (N,3) array of positions
+            release_frame: optional index into positions for release marker
+            title: plot title
+        """
         fig = Figure(figsize=(8, 6))
         ax = fig.add_subplot(111, projection='3d')
-        
+
         valid_mask = ~np.isnan(positions).any(axis=1)
         valid_pos = positions[valid_mask]
-        
-        ax.plot(valid_pos[:, 0], valid_pos[:, 1], valid_pos[:, 2], 
+
+        ax.plot(valid_pos[:, 0], valid_pos[:, 1], valid_pos[:, 2],
                'b-', linewidth=2, label='Flight Path')
-        ax.scatter(*valid_pos[0], s=100, c='green', marker='o', label='Release')
-        ax.scatter(*valid_pos[-1], s=100, c='red', marker='x', label='Landing')
-        
+        # Start marker (first valid point)
+        if len(valid_pos) > 0:
+            ax.scatter(*valid_pos[0], s=80, c='green', marker='o', label='Start')
+        # Release marker if available
+        if release_frame is not None and len(valid_pos) > int(release_frame) >= 0:
+            ax.scatter(*valid_pos[int(release_frame)], s=120, c='orange', marker='D', label='Release')
+        # Landing marker
+        if len(valid_pos) > 0:
+            ax.scatter(*valid_pos[-1], s=100, c='red', marker='x', label='Landing')
+
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
         ax.set_zlabel('Z (mm)')
@@ -294,6 +324,107 @@ class DiscGolfAnalysisApp(QMainWindow):
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         return fig
+
+    def _plot_inspector(self, positions: np.ndarray, disc_analysis: Dict) -> Figure:
+        """Plot speed and filtered acceleration with release marker and show key metrics."""
+        fig = Figure(figsize=(10, 6))
+        ax1 = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212, sharex=ax1)
+
+        # Compute speeds and accelerations
+        dt = 1.0 / 240.0
+        velocities = np.diff(positions, axis=0) / dt
+        speeds = np.linalg.norm(velocities, axis=1)
+        acc = np.diff(speeds) / dt
+
+        # Simple moving average filter
+        window = 5
+        if len(acc) > window:
+            padded = np.concatenate([np.full(window-1, acc[0]), acc])
+            acc_filt = np.convolve(padded, np.ones(window)/window, mode='valid')[:len(acc)]
+        else:
+            acc_filt = acc
+
+        sf = np.arange(len(speeds))
+        af = np.arange(len(acc))
+
+        ax1.plot(sf, speeds, label='Speed (mm/s)')
+        rel = disc_analysis.get('release_frame')
+        if rel is not None:
+            ax1.axvline(rel, color='red', linestyle='--', label='Release')
+        ax1.set_ylabel('Speed (mm/s)')
+        ax1.legend()
+
+        ax2.plot(af, acc, label='Acceleration')
+        ax2.plot(af, acc_filt, label='Filtered Accel')
+        if rel is not None and rel-1 >= 0:
+            ax2.axvline(rel-1, color='red', linestyle='--')
+        ax2.set_ylabel('Acceleration (mm/s²)')
+        ax2.set_xlabel('Frame index (speeds)')
+        ax2.legend()
+
+        # Small metric box
+        key_ax = fig.add_axes([0.78, 0.55, 0.2, 0.35])
+        key_ax.axis('off')
+        metrics = [
+            ('Speed (km/h)', f"{disc_analysis.get('disc_speed', 0):.1f}"),
+            ('Spin (RPM)', f"{disc_analysis.get('spin', 0):.1f}"),
+            ('Hyzer (°)', f"{disc_analysis.get('hyzer_angle', 0):.2f}"),
+            ('Launch (°)', f"{disc_analysis.get('launch_angle', 0):.2f}"),
+            ('Nose (°)', f"{disc_analysis.get('nose_angle', 0):.2f}"),
+        ]
+        txt = '\n'.join([f"{k}: {v}" for k, v in metrics])
+        key_ax.text(0, 1, txt, va='top', fontsize=10, family='monospace')
+
+        fig.tight_layout()
+        return fig
+
+    def select_folder_on_start(self):
+        folder = QFileDialog.getExistingDirectory(self, 'Select session folder', '')
+        if folder:
+            self.selected_folder = folder
+            self.processed_files = set()
+            self.poll_timer.start()
+            self.statusBar().showMessage(f'Watching: {folder}')
+        else:
+            self.selected_folder = None
+
+    def select_folder_dialog(self):
+        folder = QFileDialog.getExistingDirectory(self, 'Select session folder', '')
+        if folder:
+            self.selected_folder = folder
+            self.processed_files = set()
+            self.poll_timer.start()
+            self.statusBar().showMessage(f'Watching: {folder}')
+
+    def poll_folder(self):
+        if not getattr(self, 'selected_folder', None):
+            return
+        from pathlib import Path
+        p = Path(self.selected_folder)
+        jsons = list(p.rglob('*.json'))
+        for j in sorted(jsons):
+            if str(j) in self.processed_files:
+                continue
+            # Process new file
+            try:
+                loader = QTMLoader()
+                ok = loader.load_from_json(str(j))
+                if not ok:
+                    continue
+                body = loader.extract_disc_data()
+                if body is None:
+                    continue
+                analyzer = DiscAnalyzer(frame_rate=loader.frame_rate or 240.0)
+                res = analyzer.analyze_disc_trajectory(body)
+                self.body_data = body
+                self.current_throw_name = j.name
+                self.update_visualizations(res)
+                self.processed_files.add(str(j))
+                self.statusBar().showMessage(f'Processed: {j.name}')
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).exception('Failed to process %s: %s', j, e)
     
     @staticmethod
     def _plot_rotation_and_orientation(rotations: np.ndarray, title: str) -> Figure:
