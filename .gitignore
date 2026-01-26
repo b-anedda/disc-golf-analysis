@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Data and large project files
+Data/
+AIM models/
+Calibrations/
+Messages/
+
+# QTM / project settings backups
+*.qtmproj.bak
+*.qpr
+*.paf
+
+# Settings and IDE
+Settings/
+.vscode/
+.idea/
+
+# Misc
+*.log
+.DS_Store
+
+# Output
+session_analysis.csv
