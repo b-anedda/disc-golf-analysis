@@ -1,6 +1,7 @@
 """PyQt6-based GUI application for disc golf throw analysis."""
 
 import sys
+import re
 from typing import Optional, Dict
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -17,6 +18,21 @@ from matplotlib.figure import Figure
 from src.qtm_loader import QTMLoader
 from src.throw_analysis import DiscAnalyzer
 from src.visualization.visualizer import ThrowVisualizer
+
+
+def natural_sort_key(path_or_str):
+    """
+    Generate a natural sort key for paths/strings with numeric components.
+    
+    Examples:
+        Throw_2.json  -> ['Throw_', 2, '.json']
+        Throw_10.json -> ['Throw_', 10, '.json']
+        
+    This ensures Throw_2 sorts before Throw_10 (numeric sort, not lexicographic).
+    """
+    name = str(path_or_str).lower()
+    # Split the string into text and numeric parts
+    return [int(text) if text.isdigit() else text for text in re.split(r'(\d+)', name)]
 
 
 class DiscGolfAnalysisApp(QMainWindow):
@@ -37,6 +53,8 @@ class DiscGolfAnalysisApp(QMainWindow):
 
         # Files already processed
         self.processed_files = set()
+        # Map of available throw name -> path
+        self.available_throws = {}
         # Poll timer for new files
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(2000)
@@ -64,18 +82,13 @@ class DiscGolfAnalysisApp(QMainWindow):
         folder_btn.clicked.connect(self.select_folder_dialog)
         control_layout.addWidget(folder_btn)
         
-        load_data_btn = QPushButton("Load Throw Data")
-        load_data_btn.clicked.connect(self.load_throw_data)
-        control_layout.addWidget(load_data_btn)
-        
+        # Removed separate "Load Throw Data" and "Analyze" buttons
         control_layout.addWidget(QLabel("Select Throw:"))
         self.throw_combo = QComboBox()
-        self.throw_combo.addItems(["Throw1", "throw2", "Static_Disc"])
+        # Will be populated from selected session folder
+        self.throw_combo.addItems([])
+        self.throw_combo.currentIndexChanged.connect(self.on_throw_selected)
         control_layout.addWidget(self.throw_combo)
-        
-        analyze_btn = QPushButton("Analyze")
-        analyze_btn.clicked.connect(self.analyze_throw)
-        control_layout.addWidget(analyze_btn)
         
         layout.addLayout(control_layout)
         
@@ -84,26 +97,34 @@ class DiscGolfAnalysisApp(QMainWindow):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
         
-        # Tab widget for visualizations
+        # Tab widget for visualizations (left) + metrics panel (right)
+        content_layout = QHBoxLayout()
+
         self.tabs = QTabWidget()
-        
-        self.trajectory_3d = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
-        self.tabs.addTab(self.trajectory_3d, "3D Flight Path")
-        
-        self.stability_metrics = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
-        self.tabs.addTab(self.stability_metrics, "Stability Metrics")
-        
-        self.marker_trajectories = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
-        self.tabs.addTab(self.marker_trajectories, "Individual Markers")
-        
-        self.summary_plot = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
-        self.tabs.addTab(self.summary_plot, "Analysis Summary")
-        
-        # Add Inspector tab for velocity/accel and key metrics
-        self.inspector_plot = FigureCanvas(Figure(figsize=(5, 4), dpi=100))
+        self.trajectory_3d = FigureCanvas(Figure(figsize=(6, 5), dpi=100))
+        self.tabs.addTab(self.trajectory_3d, "Disc Path")
+
+        # Inspector tab only (velocity + filtered accel)
+        self.inspector_plot = FigureCanvas(Figure(figsize=(6, 5), dpi=100))
         self.tabs.addTab(self.inspector_plot, "Inspector")
-        
-        layout.addWidget(self.tabs)
+
+        content_layout.addWidget(self.tabs, stretch=3)
+
+        # Metrics panel: show the six key parameters
+        self.metrics_label = QLabel()
+        self.metrics_label.setMinimumWidth(340)
+        self.metrics_label.setWordWrap(True)
+        # Prominent boxed styling for key parameters
+        self.metrics_label.setStyleSheet(
+            "background: #f2f2f2; border: 1px solid #888; border-radius: 6px; "
+            "padding: 12px; color: #111; font-family: 'Consolas', 'Courier New', monospace; "
+            "font-size: 14pt;"
+        )
+        self.metrics_label.setText('<div style="font-family:monospace; font-size:14pt;">No analysis yet</div>')
+        self.metrics_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        content_layout.addWidget(self.metrics_label, stretch=1)
+
+        layout.addLayout(content_layout)
         
         central.setLayout(layout)
         
@@ -201,10 +222,19 @@ class DiscGolfAnalysisApp(QMainWindow):
         residuals = np.random.normal(0.5, 0.1, num_frames)
         residuals = np.clip(residuals, 0, 2)
         
+        # Generate synthetic marker data (Mid marker = same as body center)
+        markers = {
+            'Mid': positions.copy(),
+            'Center': positions + np.random.normal(0, 2, positions.shape),
+            'Wide': positions + np.random.normal(0, 3, positions.shape),
+            'Close': positions + np.random.normal(0, 2, positions.shape)
+        }
+        
         self.body_data = {
             'position': positions,
             'rotation': rotations,
-            'residual': residuals
+            'residual': residuals,
+            'markers': markers
         }
     
     def analyze_throw(self):
@@ -242,62 +272,181 @@ class DiscGolfAnalysisApp(QMainWindow):
     def update_visualizations(self, disc_analysis):
         """Update all visualization tabs with 6DOF body data."""
         visualizer = ThrowVisualizer()
-        
-        # Extract position for visualization
+
+        # Extract 6DOF data for visualization
         positions = self.body_data['position']
         rotations = self.body_data['rotation']
-        
-        # 3D Trajectory - body center of mass path with start and release markers
-        fig = self._plot_body_trajectory_3d(positions, disc_analysis.get('release_frame'), self.current_throw_name)
+
+        # Get net impact frame if detected
+        net_impact_frame = disc_analysis.get('net_impact_frame')
+
+        # Disc Path - Multiple views (top, side, back)
+        fig = self._plot_body_trajectory_multiview(
+            positions, 
+            disc_analysis.get('release_frame'), 
+            net_impact_frame,
+            self.current_throw_name
+        )
         self.trajectory_3d.figure = fig
         self.trajectory_3d.draw()
-        
-        # Stability Metrics
-        fig = self._plot_stability_metrics(positions)
-        self.stability_metrics.figure = fig
-        self.stability_metrics.draw()
-        
-        # Angular velocities and orientation
-        fig = self._plot_rotation_and_orientation(rotations, self.current_throw_name)
-        self.marker_trajectories.figure = fig  # Reuse this canvas
-        self.marker_trajectories.draw()
-        
-        # Summary
-        fig = self._plot_analysis_summary(disc_analysis, self.current_throw_name)
-        self.summary_plot.figure = fig
-        self.summary_plot.draw()
+
+        # Inspector: velocity and filtered acceleration
+        fig = self._plot_inspector(positions, disc_analysis, net_impact_frame)
+        self.inspector_plot.figure = fig
+        self.inspector_plot.draw()
+
+        # Update metrics panel with the six key parameters
+        metrics = {
+            'Disc Speed (km/h)': disc_analysis.get('disc_speed'),
+            'Spin (RPM)': disc_analysis.get('spin'),
+            'Hyzer (+hyzer)': disc_analysis.get('hyzer_angle'),
+            'Launch (°)': disc_analysis.get('launch_angle'),
+            'Nose (+up)': disc_analysis.get('nose_angle'),
+            'Wobble RMS (°)': disc_analysis.get('wobble_amplitude'),
+        }
+        lines = []
+        import numbers
+        for k, v in metrics.items():
+            if v is None:
+                lines.append(f"{k:<16} --")
+            elif isinstance(v, numbers.Number):
+                # format numeric values (handles numpy types)
+                if 'km/h' in k:
+                    lines.append(f"{k:<16} {float(v):.1f}")
+                else:
+                    lines.append(f"{k:<16} {float(v):.2f}")
+            else:
+                lines.append(f"{k:<16} {v}")
+
+        # Render metrics as preformatted text for alignment
+        html = "<div style='font-family:monospace; font-size:14pt;'><b>Key Parameters</b><pre>" + "\n".join(lines) + "</pre></div>"
+        self.metrics_label.setText(html)
     
     @staticmethod
-    def _plot_body_trajectory_3d(positions: np.ndarray, release_frame: int = None, title: str = "") -> Figure:
-        """Plot 3D body trajectory with start, release and landing markers.
+    def _plot_body_trajectory_multiview(
+        positions: np.ndarray, 
+        release_frame: int = None, 
+        net_impact_frame: int = None,
+        title: str = ""
+    ) -> Figure:
+        """Plot disc trajectory from three views: top (X-Y), side (Z-X), back (Z-Y).
 
         Args:
-            positions: (N,3) array of positions
+            positions: (N,3) array of 6DOF body positions
             release_frame: optional index into positions for release marker
+            net_impact_frame: optional index for net impact (truncates visualization)
+            title: plot title
+        """
+        fig = Figure(figsize=(8, 12))
+        
+        valid_mask = ~np.isnan(positions).any(axis=1)
+        valid_pos = positions[valid_mask]
+        
+        # Truncate at net impact if detected
+        if net_impact_frame is not None and net_impact_frame < len(valid_pos):
+            viz_pos = valid_pos[:net_impact_frame]
+        else:
+            viz_pos = valid_pos
+        
+        # Helper function to plot a single view
+        def plot_view(ax, x_data, y_data, x_label, y_label, view_name):
+            ax.plot(x_data, y_data, 'b-', linewidth=2, label='Flight Path')
+            
+            # Start marker
+            if len(viz_pos) > 0:
+                ax.scatter(x_data[0], y_data[0], s=80, c='green', marker='o', 
+                          label='Start', edgecolors='darkgreen', linewidths=2)
+            
+            # Release marker if available
+            if release_frame is not None and 0 <= int(release_frame) < len(viz_pos):
+                ax.scatter(x_data[int(release_frame)], y_data[int(release_frame)], s=120, c='orange', 
+                          marker='D', label='Release', edgecolors='darkorange', linewidths=2)
+            
+            # Net impact marker
+            if net_impact_frame is not None and 0 < net_impact_frame < len(valid_pos):
+                net_x = valid_pos[net_impact_frame, 0] if x_label == 'X (mm)' else valid_pos[net_impact_frame, 2] if x_label == 'Z (mm)' else valid_pos[net_impact_frame, 0]
+                net_y = valid_pos[net_impact_frame, 1] if y_label == 'Y (mm)' else valid_pos[net_impact_frame, 2] if y_label == 'Z (mm)' else valid_pos[net_impact_frame, 1]
+                ax.scatter(net_x, net_y, s=150, c='red', marker='X', 
+                          label='Net Impact', edgecolors='darkred', linewidths=2)
+            
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.set_aspect('equal', adjustable='box')
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{view_name}")
+            ax.legend(loc='best', fontsize=8)
+        
+        # Top view (X-Y plane)
+        ax1 = fig.add_subplot(311)
+        plot_view(ax1, viz_pos[:, 0], viz_pos[:, 1], 'X (mm)', 'Y (mm)', 'Top View (X-Y)')
+        
+        # Side view (Z-X plane, looking from the right)
+        ax2 = fig.add_subplot(312)
+        plot_view(ax2, viz_pos[:, 0], viz_pos[:, 2], 'X (mm)', 'Z (mm)', 'Side View (Z-X)')
+        
+        # Back view (Z-Y plane, looking from behind)
+        ax3 = fig.add_subplot(313)
+        plot_view(ax3, viz_pos[:, 1], viz_pos[:, 2], 'Y (mm)', 'Z (mm)', 'Back View (Z-Y)')
+        
+        if net_impact_frame is not None:
+            fig.suptitle(f"{title} - Disc Path (to Net Impact)", fontsize=14, fontweight='bold')
+        else:
+            fig.suptitle(f"{title} - Disc Path", fontsize=14, fontweight='bold')
+        
+        fig.tight_layout()
+        return fig
+    
+    @staticmethod
+    def _plot_body_trajectory_3d(
+        positions: np.ndarray, 
+        release_frame: int = None, 
+        net_impact_frame: int = None,
+        title: str = ""
+    ) -> Figure:
+        """Plot top-down disc trajectory (X-Y plane) using 6DOF body position with start, release, net impact markers.
+
+        Args:
+            positions: (N,3) array of 6DOF body positions
+            release_frame: optional index into positions for release marker
+            net_impact_frame: optional index for net impact (truncates visualization)
             title: plot title
         """
         fig = Figure(figsize=(8, 6))
-        ax = fig.add_subplot(111, projection='3d')
+        ax = fig.add_subplot(111)
 
         valid_mask = ~np.isnan(positions).any(axis=1)
         valid_pos = positions[valid_mask]
+        
+        # Truncate at net impact if detected
+        if net_impact_frame is not None and net_impact_frame < len(valid_pos):
+            viz_pos = valid_pos[:net_impact_frame]
+        else:
+            viz_pos = valid_pos
 
-        ax.plot(valid_pos[:, 0], valid_pos[:, 1], valid_pos[:, 2],
+        ax.plot(viz_pos[:, 0], viz_pos[:, 1],
                'b-', linewidth=2, label='Flight Path')
+        
         # Start marker (first valid point)
-        if len(valid_pos) > 0:
-            ax.scatter(*valid_pos[0], s=80, c='green', marker='o', label='Start')
+        if len(viz_pos) > 0:
+            ax.scatter(viz_pos[0, 0], viz_pos[0, 1], s=80, c='green', marker='o', label='Start', edgecolors='darkgreen', linewidths=2)
+        
         # Release marker if available
-        if release_frame is not None and len(valid_pos) > int(release_frame) >= 0:
-            ax.scatter(*valid_pos[int(release_frame)], s=120, c='orange', marker='D', label='Release')
-        # Landing marker
-        if len(valid_pos) > 0:
-            ax.scatter(*valid_pos[-1], s=100, c='red', marker='x', label='Landing')
+        if release_frame is not None and 0 <= int(release_frame) < len(viz_pos):
+            ax.scatter(viz_pos[int(release_frame), 0], viz_pos[int(release_frame), 1], s=120, c='orange', marker='D', label='Release', edgecolors='darkorange', linewidths=2)
+        
+        # Net impact marker if available
+        if net_impact_frame is not None and 0 < net_impact_frame < len(valid_pos):
+            # Use full valid_pos to get the actual impact point
+            ax.scatter(valid_pos[net_impact_frame, 0], valid_pos[net_impact_frame, 1], s=150, c='red', marker='X', label='Net Impact', edgecolors='darkred', linewidths=2)
 
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
-        ax.set_zlabel('Z (mm)')
-        ax.set_title(f"{title} - 3D Flight Path")
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.3)
+        if net_impact_frame is not None:
+            ax.set_title(f"{title} - Disc Path - Top View (to Net Impact)")
+        else:
+            ax.set_title(f"{title} - Disc Path - Top View")
         ax.legend()
         fig.tight_layout()
         return fig
@@ -325,56 +474,67 @@ class DiscGolfAnalysisApp(QMainWindow):
         fig.tight_layout()
         return fig
 
-    def _plot_inspector(self, positions: np.ndarray, disc_analysis: Dict) -> Figure:
-        """Plot speed and filtered acceleration with release marker and show key metrics."""
-        fig = Figure(figsize=(10, 6))
+    def _plot_inspector(self, positions: np.ndarray, disc_analysis: Dict, net_impact_frame: int = None) -> Figure:
+        """Plot disc velocity and filtered acceleration with release and net impact markers.
+        
+        Args:
+            positions: Position array
+            disc_analysis: Analysis results dictionary
+            net_impact_frame: Optional frame index for net impact (truncates visualization)
+        """
+        fig = Figure(figsize=(8, 6))
         ax1 = fig.add_subplot(211)
         ax2 = fig.add_subplot(212, sharex=ax1)
 
-        # Compute speeds and accelerations
         dt = 1.0 / 240.0
         velocities = np.diff(positions, axis=0) / dt
         speeds = np.linalg.norm(velocities, axis=1)
-        acc = np.diff(speeds) / dt
 
-        # Simple moving average filter
+        # Acceleration from speeds
+        if len(speeds) >= 2:
+            acc = np.diff(speeds) / dt
+        else:
+            acc = np.array([])
+
+        # Filter acceleration with simple moving average
         window = 5
-        if len(acc) > window:
+        if len(acc) >= window and window > 1:
             padded = np.concatenate([np.full(window-1, acc[0]), acc])
             acc_filt = np.convolve(padded, np.ones(window)/window, mode='valid')[:len(acc)]
         else:
             acc_filt = acc
 
-        sf = np.arange(len(speeds))
-        af = np.arange(len(acc))
+        # Truncate at net impact if detected
+        if net_impact_frame is not None:
+            speeds = speeds[:net_impact_frame]
+            acc = acc[:net_impact_frame] if net_impact_frame <= len(acc) else acc
+            acc_filt = acc_filt[:net_impact_frame] if net_impact_frame <= len(acc_filt) else acc_filt
 
-        ax1.plot(sf, speeds, label='Speed (mm/s)')
+        # X axes (frame indices) - align speeds to positions by using frame index = position index +1
+        sf = np.arange(1, len(speeds) + 1)
+        af = np.arange(2, 2 + len(acc))  # acceleration corresponds to frames starting at 2
+
+        ax1.plot(sf, speeds, color='tab:blue', label='Speed (mm/s)', linewidth=1.5)
         rel = disc_analysis.get('release_frame')
-        if rel is not None:
-            ax1.axvline(rel, color='red', linestyle='--', label='Release')
+        if rel is not None and rel >= 0 and len(sf) > 0 and rel <= sf[-1]:
+            ax1.axvline(rel, color='orange', linestyle='--', linewidth=2, label='Release')
+        if net_impact_frame is not None and net_impact_frame >= 0 and len(sf) > 0:
+            ax1.axvline(net_impact_frame, color='red', linestyle='--', linewidth=2, label='Net Impact')
         ax1.set_ylabel('Speed (mm/s)')
+        ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        ax2.plot(af, acc, label='Acceleration')
-        ax2.plot(af, acc_filt, label='Filtered Accel')
-        if rel is not None and rel-1 >= 0:
-            ax2.axvline(rel-1, color='red', linestyle='--')
+        ax2.plot(af, acc, color='tab:gray', label='Acceleration', linewidth=1)
+        if len(acc_filt) > 0:
+            ax2.plot(af, acc_filt, color='tab:green', label='Filtered Accel', linewidth=1.5)
+        if rel is not None and rel >= 2 and len(af) > 0 and rel <= af[-1]:
+            ax2.axvline(rel, color='orange', linestyle='--', linewidth=2)
+        if net_impact_frame is not None and net_impact_frame >= 2 and len(af) > 0:
+            ax2.axvline(net_impact_frame, color='red', linestyle='--', linewidth=2)
         ax2.set_ylabel('Acceleration (mm/s²)')
-        ax2.set_xlabel('Frame index (speeds)')
+        ax2.set_xlabel('Frame index')
+        ax2.grid(True, alpha=0.3)
         ax2.legend()
-
-        # Small metric box
-        key_ax = fig.add_axes([0.78, 0.55, 0.2, 0.35])
-        key_ax.axis('off')
-        metrics = [
-            ('Speed (km/h)', f"{disc_analysis.get('disc_speed', 0):.1f}"),
-            ('Spin (RPM)', f"{disc_analysis.get('spin', 0):.1f}"),
-            ('Hyzer (°)', f"{disc_analysis.get('hyzer_angle', 0):.2f}"),
-            ('Launch (°)', f"{disc_analysis.get('launch_angle', 0):.2f}"),
-            ('Nose (°)', f"{disc_analysis.get('nose_angle', 0):.2f}"),
-        ]
-        txt = '\n'.join([f"{k}: {v}" for k, v in metrics])
-        key_ax.text(0, 1, txt, va='top', fontsize=10, family='monospace')
 
         fig.tight_layout()
         return fig
@@ -386,6 +546,8 @@ class DiscGolfAnalysisApp(QMainWindow):
             self.processed_files = set()
             self.poll_timer.start()
             self.statusBar().showMessage(f'Watching: {folder}')
+            # populate available throws
+            self.update_throw_list()
         else:
             self.selected_folder = None
 
@@ -396,35 +558,152 @@ class DiscGolfAnalysisApp(QMainWindow):
             self.processed_files = set()
             self.poll_timer.start()
             self.statusBar().showMessage(f'Watching: {folder}')
+            self.update_throw_list()
 
-    def poll_folder(self):
+    def update_throw_list(self):
+        """Scan the selected folder for JSON export files and populate the throw combo."""
+        from pathlib import Path
         if not getattr(self, 'selected_folder', None):
             return
-        from pathlib import Path
         p = Path(self.selected_folder)
-        jsons = list(p.rglob('*.json'))
-        for j in sorted(jsons):
+        jsons = sorted(p.rglob('*.json'), key=natural_sort_key)
+        self.available_throws = {j.name: str(j) for j in jsons}
+
+        # Update combo while preserving current selection if possible
+        current = self.throw_combo.currentText()
+        self.throw_combo.blockSignals(True)
+        self.throw_combo.clear()
+        self.throw_combo.addItems(list(self.available_throws.keys()))
+        # Restore selection if it exists
+        if current and current in self.available_throws:
+            idx = list(self.available_throws.keys()).index(current)
+            self.throw_combo.setCurrentIndex(idx)
+        self.throw_combo.blockSignals(False)
+
+    def on_throw_selected(self, index: int):
+        """Load and analyze the selected throw (by combo index)."""
+        try:
+            if index < 0:
+                return
+            name = self.throw_combo.itemText(index)
+            path = self.available_throws.get(name)
+            if not path:
+                return
+
+            loader = QTMLoader()
+            ok = loader.load_from_json(path)
+            if not ok:
+                self.statusBar().showMessage(f'Failed to load: {name}')
+                return
+            body = loader.extract_disc_data()
+            if body is None:
+                self.statusBar().showMessage(f'No body data in: {name}')
+                return
+
+            analyzer = DiscAnalyzer(frame_rate=loader.frame_rate or 240.0)
+            res = analyzer.analyze_disc_trajectory(body)
+            self.body_data = body
+            self.current_throw_name = name
+            self.update_visualizations(res)
+            self.statusBar().showMessage(f'Loaded: {name}')
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).exception('Failed to load selected throw: %s', e)
+
+    def poll_folder(self):
+        """Poll the selected folder for new JSON files (typically from QTM exports)."""
+        if not getattr(self, 'selected_folder', None):
+            return
+        
+        from pathlib import Path
+        import logging as _logging
+        logger = _logging.getLogger(__name__)
+        
+        p = Path(self.selected_folder)
+        
+        # Look for JSON files in the directory (not recursive to avoid subdirectories)
+        jsons = sorted(p.glob('*.json'), key=natural_sort_key)
+        
+        if not jsons:
+            # Optionally try one level deep (e.g., Data/2026-02-12/Throw_1.json)
+            jsons = sorted(p.glob('*/*.json'), key=natural_sort_key)
+        
+        new_files_found = 0
+        latest_throw_name = None
+        
+        for j in jsons:
             if str(j) in self.processed_files:
                 continue
+            
+            new_files_found += 1
+            print(f"[Polling] New file detected: {j.name}")
+            
             # Process new file
             try:
+                print(f"  Loading {j.name}...")
                 loader = QTMLoader()
                 ok = loader.load_from_json(str(j))
+                
                 if not ok:
+                    msg = f"Failed to load JSON: {j.name}"
+                    print(f"  Error: {msg}")
+                    self.statusBar().showMessage(f"Error: {msg}")
                     continue
+                
+                print(f"  Extracting 6DOF data from {j.name}...")
                 body = loader.extract_disc_data()
+                
                 if body is None:
+                    msg = f"No 6DOF body data in: {j.name}"
+                    print(f"  Error: {msg}")
+                    self.statusBar().showMessage(f"Error: {msg}")
                     continue
+                
+                print(f"  Analyzing trajectory...")
                 analyzer = DiscAnalyzer(frame_rate=loader.frame_rate or 240.0)
                 res = analyzer.analyze_disc_trajectory(body)
+                
+                print(f"  Updating visualization...")
                 self.body_data = body
                 self.current_throw_name = j.name
+                latest_throw_name = j.name  # Track the latest throw processed
                 self.update_visualizations(res)
                 self.processed_files.add(str(j))
-                self.statusBar().showMessage(f'Processed: {j.name}')
+                
+                # Update available throws list so user can manually select them
+                try:
+                    self.available_throws[j.name] = str(j)
+                except Exception as e:
+                    logger.warning('Failed to add throw to available list: %s', e)
+                
+                msg = f'✓ Processed: {j.name}'
+                print(f"  {msg}")
+                self.statusBar().showMessage(msg)
+                
             except Exception as e:
-                import logging as _logging
-                _logging.getLogger(__name__).exception('Failed to process %s: %s', j, e)
+                msg = f'Failed to process {j.name}: {str(e)}'
+                print(f"  ERROR: {msg}")
+                self.statusBar().showMessage(f"Error: {msg}")
+                logger.exception('Failed to process %s', j, exc_info=True)
+        
+        # Update throw list and select the latest throw if one was processed
+        if new_files_found > 0:
+            self.update_throw_list()
+            # Select the newest throw in the combo box to display it
+            if latest_throw_name:
+                found_index = -1
+                for i in range(self.throw_combo.count()):
+                    if self.throw_combo.itemText(i) == latest_throw_name:
+                        found_index = i
+                        break
+                if found_index >= 0:
+                    self.throw_combo.blockSignals(False)  # Ensure signals are not blocked
+                    self.throw_combo.setCurrentIndex(found_index)
+                    print(f"[Polling] Selected newest throw: {latest_throw_name}")
+        
+        if new_files_found == 0 and jsons:
+            # Just print to console, don't clutter status bar
+            print(f"[Polling] Watching {self.selected_folder}: {len(jsons)} file(s), all processed")
     
     @staticmethod
     def _plot_rotation_and_orientation(rotations: np.ndarray, title: str) -> Figure:

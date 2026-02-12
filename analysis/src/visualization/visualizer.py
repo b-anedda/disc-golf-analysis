@@ -215,9 +215,9 @@ class ThrowVisualizer:
         # (3) Hyzer Angle
         ax = axes[0, 2]
         hyzer = disc_analysis.get('hyzer_angle', 0)
-        ax.barh(['Hyzer'], [hyzer], color='#2ecc71', edgecolor='black', linewidth=2)
+        ax.barh(['Hyzer (+hyzer)'], [hyzer], color='#2ecc71', edgecolor='black', linewidth=2)
         ax.set_xlabel('Angle (degrees)')
-        ax.set_title('(3) Hyzer Angle at Release', fontweight='bold')
+        ax.set_title('(3) Hyzer Angle at Release (+hyzer)', fontweight='bold')
         ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
         ax.text(hyzer + 2, 0, f'{hyzer:.1f}°', va='center', fontweight='bold')
         ax.grid(True, alpha=0.3, axis='x')
@@ -235,9 +235,9 @@ class ThrowVisualizer:
         # (5) Nose Angle
         ax = axes[1, 1]
         nose = disc_analysis.get('nose_angle', 0)
-        ax.barh(['Nose'], [nose], color='#9b59b6', edgecolor='black', linewidth=2)
+        ax.barh(['Nose (+up)'], [nose], color='#9b59b6', edgecolor='black', linewidth=2)
         ax.set_xlabel('Angle (degrees)')
-        ax.set_title('(5) Nose Angle at Release', fontweight='bold')
+        ax.set_title('(5) Nose Angle at Release (+up)', fontweight='bold')
         ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
         ax.text(nose + 2, 0, f'{nose:.1f}°', va='center', fontweight='bold')
         ax.grid(True, alpha=0.3, axis='x')
@@ -278,9 +278,9 @@ class ThrowVisualizer:
         release_text = "RELEASE PARAMETERS\n" + "="*70 + "\n"
         release_text += f"  Disc Speed: {disc_analysis.get('disc_speed', 0):.0f} mm/s  |  "
         release_text += f"Spin: {disc_analysis.get('spin', 0):.0f} RPM  |  "
-        release_text += f"Hyzer: {disc_analysis.get('hyzer_angle', 0):.1f}°  |  "
+        release_text += f"Hyzer (+hyzer): {disc_analysis.get('hyzer_angle', 0):.1f}°  |  "
         release_text += f"Launch: {disc_analysis.get('launch_angle', 0):.1f}°  |  "
-        release_text += f"Nose: {disc_analysis.get('nose_angle', 0):.1f}°\n"
+        release_text += f"Nose (+up): {disc_analysis.get('nose_angle', 0):.1f}°\n"
         
         ax.text(0.05, 0.5, release_text, fontsize=11, family='monospace',
                verticalalignment='center', transform=ax.transAxes,

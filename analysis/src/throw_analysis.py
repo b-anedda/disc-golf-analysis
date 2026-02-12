@@ -5,8 +5,11 @@ extracting key disc parameters at release. No thrower biomechanics analysis.
 """
 
 from typing import Dict, Optional, Tuple
+import logging
 import numpy as np
 from scipy.signal import find_peaks, butter, sosfiltfilt
+
+logger = logging.getLogger(__name__)
 
 
 class DiscAnalyzer:
@@ -46,6 +49,8 @@ class DiscAnalyzer:
             # Early phase duration and timeline
             'early_phase_duration': None,
             'total_frames_analyzed': None,
+            'net_impact_detected': False,
+            'net_impact_frame': None,
             
             # 6 KEY DISC PARAMETERS AT RELEASE
             'disc_speed': None,           # (1) Disc velocity at release (km/h)
@@ -53,7 +58,7 @@ class DiscAnalyzer:
             'hyzer_angle': None,          # (3) Hyzer angle at release (degrees)
             'launch_angle': None,         # (4) Launch angle at release (degrees)
             'nose_angle': None,           # (5) Nose angle at release (degrees)
-            'wobble_amplitude': None,     # (6) Roll angle range during early phase (degrees)
+            'wobble_amplitude': None,     # (6) Roll angle oscillation amplitude (degrees)
             
             # Early phase disc dynamics
             'acceleration_phase_duration': None,  # Time from start to max velocity
@@ -70,17 +75,26 @@ class DiscAnalyzer:
             'angular_velocity_roll': None,        # X-axis rotation (rad/s)
         }
         
-        # Extract position and rotation data
+        # Extract position and rotation data from 6DOF rigid body
         positions = body_data['position']
         rotations = body_data['rotation']
         
         # Remove NaN values
         valid_mask = ~np.isnan(positions).any(axis=1)
+        
         if np.sum(valid_mask) < 2:
             return results
         
         positions = positions[valid_mask]
         rotations = rotations[valid_mask]
+        
+        # DETECT NET IMPACT and truncate data before impact
+        impact_frame = self._detect_net_impact(positions)
+        if impact_frame is not None and impact_frame > 10:  # Need at least 10 frames for analysis
+            positions = positions[:impact_frame]
+            rotations = rotations[:impact_frame]
+            results['net_impact_detected'] = True
+            results['net_impact_frame'] = int(impact_frame)
         
         # EXTRACT EARLY PHASE (first ~1 second or all data if shorter)
         early_phase_frames = min(
@@ -117,35 +131,85 @@ class DiscAnalyzer:
         accel_params = self._analyze_acceleration_phase(positions_early, speeds_early)
         results.update(accel_params)
         
-        # Wobble analysis during early phase (RMS and range)
-        wobble_res = self._calculate_roll_angle_range(rotations_early)
-        if isinstance(wobble_res, tuple) and len(wobble_res) == 2:
-            results['wobble_amplitude'] = wobble_res[0]  # RMS
-            results['wobble_range'] = wobble_res[1]
-        else:
-            results['wobble_amplitude'] = wobble_res
-        
         # Release position
         results['release_z_position'] = positions_early[0, 2]
         results['release_tilt_angle'] = self._get_tilt_from_rotation(rotations_early[0])
         
         return results
     
+    def _detect_net_impact(self, positions: np.ndarray) -> Optional[int]:
+        """
+        Detect when the disc hits the net by identifying velocity drop.
+        
+        Net impact is defined as the first frame after release where velocity
+        drops below 50% of the release velocity.
+        
+        Args:
+            positions: Position array (num_frames, 3) in mm
+            
+        Returns:
+            Frame index of net impact, or None if no impact detected
+        """
+        try:
+            if len(positions) < 20:
+                return None
+            
+            # Calculate velocities and speeds
+            velocities = np.diff(positions, axis=0) / self.dt
+            speeds = np.linalg.norm(velocities, axis=1)
+            
+            if len(speeds) < 10:
+                return None
+            
+            # Find the release frame (first velocity peak in valid range)
+            MIN_RELEASE_SPEED = 3000.0   # 3 m/s
+            MAX_RELEASE_SPEED = 40000.0  # 40 m/s
+            
+            # Find all local maxima (peaks) in velocity within valid range
+            release_frame = 0
+            for i in range(1, len(speeds) - 1):
+                if speeds[i] > speeds[i-1] and speeds[i] > speeds[i+1]:
+                    if MIN_RELEASE_SPEED <= speeds[i] <= MAX_RELEASE_SPEED:
+                        release_frame = i
+                        break
+            
+            if release_frame == 0:
+                return None
+            
+            # Get release velocity
+            release_speed = speeds[release_frame]
+            
+            # Define impact threshold: 50% of release velocity
+            impact_threshold = 0.5 * release_speed
+            
+            # Only look for impact after release with small buffer
+            search_start = release_frame + 3  # 3-frame buffer after release
+            
+            if search_start >= len(speeds):
+                return None
+            
+            # Find first frame where velocity drops below threshold
+            post_release_speeds = speeds[search_start:]
+            impact_candidates = np.where(post_release_speeds < impact_threshold)[0]
+            
+            if len(impact_candidates) > 0:
+                # Return the first velocity drop below threshold
+                impact_idx = search_start + impact_candidates[0]
+                return int(impact_idx)
+            
+            return None
+            
+        except Exception:
+            return None
+    
     def _detect_release_frame(self, speeds: np.ndarray) -> int:
         """
-        Detect release frame using advanced deceleration + zero-crossing method.
-        
-        Physics: At release:
-        1. Hand stops pushing → acceleration drops sharply (high deceleration)
-        2. Force ends → acceleration reaches zero (transition point)
-        3. Velocity is still high but below peak (aerodynamics take over)
+        Detect release frame using velocity range constraints and peak analysis.
         
         Strategy:
-        1. Calculate 5-frame moving average acceleration (smooth signal)
-        2. Find highest deceleration (most negative acceleration change)
-        3. Find where filtered acceleration crosses zero after that point
-        4. Validate: velocity should be ~10% of global maximum at this point
-        5. If all conditions met, this is the release point
+        1. Find the first velocity peak within valid throw range (3-40 m/s = 3000-40000 mm/s)
+        2. Verify it's preceded by acceleration phase
+        3. This represents the release point (maximum velocity at start of flight)
         
         Args:
             speeds: Speed array (mm/s) of shape (num_frames,)
@@ -157,61 +221,62 @@ class DiscAnalyzer:
             if len(speeds) < 10:
                 return 0
             
-            # STEP 1: Calculate acceleration with 5-frame moving average
-            accelerations = np.diff(speeds)
+            # Define valid velocity range for disc golf throws (mm/s)
+            MIN_RELEASE_SPEED = 3000.0   # 3 m/s
+            MAX_RELEASE_SPEED = 40000.0  # 40 m/s
             
-            # 5-frame moving average of acceleration for smooth detection
+            # Calculate acceleration (smoothed)
+            accelerations = np.diff(speeds)
             window_size = 5
             if len(accelerations) > window_size:
-                # Pad the beginning to maintain length alignment
                 accel_padded = np.concatenate([np.full(window_size - 1, accelerations[0]), accelerations])
-                accel_filtered = np.convolve(accel_padded, np.ones(window_size) / window_size, mode='valid')
-                # Trim to match original length
-                accel_filtered = accel_filtered[:len(accelerations)]
+                accel_smooth = np.convolve(accel_padded, np.ones(window_size) / window_size, mode='valid')
+                accel_smooth = accel_smooth[:len(accelerations)]
             else:
-                accel_filtered = accelerations
+                accel_smooth = accelerations
             
-            # STEP 2: Find the highest deceleration (most negative acceleration change)
-            # Calculate the rate of change of acceleration (jerk)
-            if len(accel_filtered) > 5:
-                jerk = np.diff(accel_filtered)
-                min_jerk_idx = np.argmin(jerk)  # Most negative jerk = highest deceleration
-                jerk_window_start = max(0, min_jerk_idx - 2)
-                jerk_window_end = min(len(accel_filtered), min_jerk_idx + 3)
-            else:
-                jerk_window_start = 0
-                jerk_window_end = len(accel_filtered)
+            # Find all local maxima (peaks) in velocity
+            peaks = []
+            for i in range(1, len(speeds) - 1):
+                if speeds[i] > speeds[i-1] and speeds[i] > speeds[i+1]:
+                    # Check if within valid velocity range
+                    if MIN_RELEASE_SPEED <= speeds[i] <= MAX_RELEASE_SPEED:
+                        peaks.append(i)
             
-            # STEP 3: In or after the deceleration window, find where acceleration reaches zero
-            search_start = jerk_window_end
-            search_end = min(len(accel_filtered), search_start + int(self.frame_rate * 0.2))  # Search forward 200ms
+            if not peaks:
+                # No valid peaks found - check if global max is in range
+                max_idx = np.argmax(speeds)
+                if MIN_RELEASE_SPEED <= speeds[max_idx] <= MAX_RELEASE_SPEED:
+                    return max_idx
+                # Otherwise find first frame above minimum
+                valid_frames = np.where(speeds >= MIN_RELEASE_SPEED)[0]
+                if len(valid_frames) > 0:
+                    return int(valid_frames[0])
+                return 0
             
-            zero_crossing_frame = None
-            for frame_idx in range(search_start, search_end):
-                if frame_idx < len(accel_filtered) - 1:
-                    # Find zero crossing: where acceleration changes from positive to negative or vice versa
-                    if accel_filtered[frame_idx] * accel_filtered[frame_idx + 1] <= 0:
-                        # Zero crossing detected
-                        zero_crossing_frame = frame_idx
-                        break
-                    # Also check if acceleration is very close to zero (within 5% of peak accel)
-                    peak_accel = np.max(np.abs(accel_filtered))
-                    if peak_accel > 0 and np.abs(accel_filtered[frame_idx]) < peak_accel * 0.05:
-                        zero_crossing_frame = frame_idx
-                        break
+            # Select the FIRST peak that meets criteria:
+            # 1. Within valid velocity range (already filtered)
+            # 2. Preceded by positive acceleration (acceleration phase)
+            # 3. High enough magnitude (at least 70% of max valid peak)
             
-            # STEP 4: Validate the candidate release frame
-            if zero_crossing_frame is not None and zero_crossing_frame < len(speeds):
-                velocity_at_candidate = speeds[zero_crossing_frame]
-                max_velocity = np.max(speeds)
-                
-                # Check if velocity is reasonable (should be high, at or near peak)
-                # At release, velocity should be close to peak (within 20% of max)
-                if velocity_at_candidate > max_velocity * 0.8:
-                    return zero_crossing_frame
+            max_valid_peak_speed = max(speeds[p] for p in peaks)
+            speed_threshold = max_valid_peak_speed * 0.7
             
-            # FALLBACK: Find maximum speed if validation fails
-            return np.argmax(speeds)
+            for peak_idx in peaks:
+                # Check if preceded by acceleration
+                if peak_idx > 5:
+                    # Look at acceleration in the 5 frames before peak
+                    pre_peak_accel = accel_smooth[max(0, peak_idx-5):peak_idx]
+                    if len(pre_peak_accel) > 0:
+                        avg_accel = np.mean(pre_peak_accel)
+                        # Require positive average acceleration before peak
+                        if avg_accel > 0:
+                            # Check speed is significant
+                            if speeds[peak_idx] >= speed_threshold:
+                                return peak_idx
+            
+            # Fallback: return first peak (closest to throw initiation)
+            return peaks[0]
             
         except Exception:
             # If anything fails, use maximum speed
@@ -237,10 +302,10 @@ class DiscAnalyzer:
             Dictionary with 6 key parameters:
             - disc_speed: Disc velocity at release (km/h)
             - spin: Spin rate around z-axis at release (RPM)
-            - hyzer_angle: Hyzer angle at release (degrees)
+            - hyzer_angle: Hyzer angle at release (+ = hyzer, degrees)
             - launch_angle: Launch angle at release (degrees)
-            - nose_angle: Nose angle at release (degrees)
-            - wobble_amplitude: Range of roll angle during early phase (degrees)
+            - nose_angle: Nose-up/down angle relative to flight direction (degrees)
+            - wobble_amplitude: Roll angle oscillation amplitude at release (degrees)
         """
         results = {
             'disc_speed': None,
@@ -291,13 +356,17 @@ class DiscAnalyzer:
                 mean_omega = np.mean(omega_z_list)
                 results['spin'] = float(mean_omega * 60.0 / (2.0 * np.pi))
 
-            # (3) HYZER ANGLE: average roll/bank across window
-            roll_angles = []
-            for R in rot_window:
-                roll_rad = np.arctan2(R[2, 1], R[2, 2])
-                roll_angles.append(np.degrees(roll_rad))
-            if roll_angles:
-                results['hyzer_angle'] = float(np.mean(roll_angles))
+            # (3) HYZER ANGLE: disc normal tilt in global Y-Z plane (spin-invariant)
+            mean_normal = None
+            if len(rot_window) > 0:
+                disc_normals = np.array([R[:, 2] for R in rot_window])
+                mean_normal = np.mean(disc_normals, axis=0)
+                normal_yz = np.array([0.0, mean_normal[1], mean_normal[2]])
+                normal_yz_norm = np.linalg.norm(normal_yz)
+                if normal_yz_norm > 1e-12:
+                    normal_yz = normal_yz / normal_yz_norm
+                    hyzer_rad = np.arctan2(normal_yz[1], normal_yz[2])
+                    results['hyzer_angle'] = float(np.degrees(hyzer_rad))
 
             # (4) LAUNCH ANGLE: compute from position delta in global X-Z plane
             # Use disc position at release and 10 frames later to form a displacement
@@ -321,20 +390,34 @@ class DiscAnalyzer:
                 launch_rad = np.arctan2(mean_vel[2], mean_vel[0])
                 results['launch_angle'] = float(np.degrees(launch_rad))
 
-            # (5) NOSE ANGLE: angle of attack = angle between velocity and disc plane
-            # Disc plane normal is the disc's local Z-axis (third column of R).
-            if len(rot_window) > 0:
-                disc_normals = np.array([R[:, 2] for R in rot_window])
-                mean_normal = np.mean(disc_normals, axis=0)
-
-                # Normalize vectors
+            # (5) NOSE ANGLE: angle of attack in the vertical plane of flight
+            # Use disc normal (local Z-axis) and flight direction from velocity.
+            if len(rot_window) > 0 and mean_normal is not None:
                 mean_normal_norm = mean_normal / (np.linalg.norm(mean_normal) + 1e-12)
                 mean_vel_norm = mean_vel / (np.linalg.norm(mean_vel) + 1e-12)
 
-                # Angle between velocity and disc plane = arcsin( dot(mean_normal, mean_vel) )
-                dot_n = np.dot(mean_normal_norm, mean_vel_norm)
-                dot_n = np.clip(dot_n, -1.0, 1.0)
-                nose_rad = np.arcsin(dot_n)
+                world_up = np.array([0.0, 0.0, 1.0])
+
+                # Build a lateral axis perpendicular to flight direction
+                lateral = np.cross(world_up, mean_vel_norm)
+                lateral_norm = np.linalg.norm(lateral)
+                if lateral_norm < 1e-6:
+                    ref = np.array([1.0, 0.0, 0.0])
+                    if abs(np.dot(ref, mean_vel_norm)) > 0.9:
+                        ref = np.array([0.0, 1.0, 0.0])
+                    lateral = np.cross(ref, mean_vel_norm)
+                    lateral_norm = np.linalg.norm(lateral)
+                lateral = lateral / (lateral_norm + 1e-12)
+
+                # Project disc normal into the flight vertical plane
+                normal_proj = mean_normal_norm - np.dot(mean_normal_norm, lateral) * lateral
+                normal_proj_norm = normal_proj / (np.linalg.norm(normal_proj) + 1e-12)
+
+                # Nose up is positive: tilt opposite to flight direction
+                nose_rad = np.arctan2(
+                    -np.dot(normal_proj_norm, mean_vel_norm),
+                    np.dot(normal_proj_norm, world_up)
+                )
                 results['nose_angle'] = float(np.degrees(nose_rad))
 
             # Spin evolution: change in spin over the early phase (look-ahead up to window_size)
@@ -350,6 +433,18 @@ class DiscAnalyzer:
 
                 if len(spin_rates) > 1:
                     results['spin_rate_evolution'] = spin_rates[-1] - spin_rates[0]
+
+            # (6) WOBBLE AMPLITUDE: roll angle oscillation amplitude over release window
+            # Calculate roll angles from rotation matrices
+            if len(rot_window) > 0:
+                roll_angles = []
+                for R in rot_window:
+                    roll_rad = np.arctan2(R[2, 1], R[2, 2])
+                    roll_angles.append(np.degrees(roll_rad))
+                
+                if len(roll_angles) > 1:
+                    roll_range = np.max(roll_angles) - np.min(roll_angles)
+                    results['wobble_amplitude'] = float(roll_range / 2.0)
 
             return results
 

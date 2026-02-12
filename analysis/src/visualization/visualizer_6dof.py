@@ -276,10 +276,10 @@ class DiscVisualizer6DOF:
         params = [
             (axes[0, 0], 'disc_speed', 'Disc Speed (mm/s)', '#3498db', 0),
             (axes[0, 1], 'spin', 'Spin Rate (RPM)', '#e74c3c', 1),
-            (axes[0, 2], 'hyzer_angle', 'Hyzer Angle (°)', '#2ecc71', 2),
+            (axes[0, 2], 'hyzer_angle', 'Hyzer Angle +hyzer (deg)', '#2ecc71', 2),
             (axes[1, 0], 'launch_angle', 'Launch Angle (°)', '#f39c12', 3),
-            (axes[1, 1], 'nose_angle', 'Nose Angle (°)', '#9b59b6', 4),
-            (axes[1, 2], 'wobble_amplitude', 'Wobble Amplitude (mm)', '#1abc9c', 5),
+            (axes[1, 1], 'nose_angle', 'Nose Angle +up (deg)', '#9b59b6', 4),
+            (axes[1, 2], 'wobble_amplitude', 'Wobble Amplitude (deg)', '#1abc9c', 5),
         ]
         
         for ax, key, label, color, idx in params:
@@ -387,10 +387,10 @@ class DiscVisualizer6DOF:
         
 Speed: {analysis_results.get('disc_speed', 0):.0f} mm/s
 Spin: {analysis_results.get('spin', 0):.0f} RPM
-Hyzer: {analysis_results.get('hyzer_angle', 0):.1f}°
+Hyzer (+hyzer): {analysis_results.get('hyzer_angle', 0):.1f}°
 Launch: {analysis_results.get('launch_angle', 0):.1f}°
-Nose: {analysis_results.get('nose_angle', 0):.1f}°
-Wobble: {analysis_results.get('wobble_amplitude', 0):.1f} mm
+Nose (+up): {analysis_results.get('nose_angle', 0):.1f}°
+Wobble: {analysis_results.get('wobble_amplitude', 0):.1f}°
 """
         ax.text(0.1, 0.5, metrics_text, fontsize=10, verticalalignment='center',
                 family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))

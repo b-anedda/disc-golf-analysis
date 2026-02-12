@@ -367,6 +367,11 @@ class QTMLoader:
             }
             self.sample_count = len(positions)
 
+            # Extract marker trajectories (for more robust velocity calculations)
+            markers = self._extract_markers_from_json(data)
+            if markers:
+                self.body_data['markers'] = markers
+
             logger.info('Loaded %d frames', self.sample_count)
             logger.debug('Position shape: %s', self.body_data['position'].shape)
             logger.debug('Rotation shape: %s', self.body_data['rotation'].shape)
@@ -375,3 +380,46 @@ class QTMLoader:
         except Exception as e:
             logger.exception('Error loading JSON: %s', e)
             return False
+    
+    def _extract_markers_from_json(self, data: Dict) -> Optional[Dict[str, np.ndarray]]:
+        """Extract individual marker trajectories from JSON data.
+        
+        Args:
+            data: Parsed JSON dictionary
+            
+        Returns:
+            Dictionary with marker names as keys and (N,3) position arrays as values
+        """
+        try:
+            markers_data = data.get('Markers', [])
+            if not markers_data:
+                return None
+            
+            markers = {}
+            for marker in markers_data:
+                marker_name = marker.get('Name')
+                if not marker_name:
+                    continue
+                
+                # Extract position values from all parts
+                positions = []
+                parts = marker.get('Parts', [])
+                for part in parts:
+                    values = part.get('Values', [])
+                    for frame_data in values:
+                        # Frame data format: [x, y, z, residual]
+                        if isinstance(frame_data, (list, tuple)) and len(frame_data) >= 3:
+                            pos = frame_data[:3]  # Just XYZ
+                            positions.append(pos)
+                        else:
+                            positions.append([np.nan, np.nan, np.nan])
+                
+                if positions:
+                    markers[marker_name] = np.array(positions)
+                    logger.debug('Extracted marker "%s": %d frames', marker_name, len(positions))
+            
+            return markers if markers else None
+            
+        except Exception as e:
+            logger.warning('Failed to extract markers: %s', e)
+            return None

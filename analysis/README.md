@@ -162,20 +162,21 @@ These 6 physics-based parameters are calculated at the **exact moment of disc re
    - Higher spin = more stable flight
    
 3. **Hyzer Angle** (degrees): Tilt of disc in z-y plane
-   - Range: -45° to +45°
-   - 0° = flat/level, positive = anhyzer, negative = hyzer
+  - Computed from disc normal projected into the global Y-Z plane
+  - 0° = flat/level, positive = hyzer, negative = anhyzer
    
 4. **Launch Angle** (degrees): Pitch angle of velocity
    - Range: 0° to 45° for typical throws
    - Controls flight duration and max height
    
-5. **Nose Angle** (degrees): Angle between disc nose and velocity in z-x plane
-   - Indicates release form and disc orientation
-   - 0° = nose directly into velocity direction
+5. **Nose Angle** (degrees): Disc nose-up/down relative to flight direction
+  - Computed from disc normal and full 3D velocity, projected into the flight vertical plane
+  - Positive = nose up, negative = nose down
    
-6. **Wobble Amplitude** (mm): Position oscillation perpendicular to flight path
-   - Typical range: 10-100 mm for stable throws
-   - Indicator of release quality and consistency
+6. **Wobble Amplitude** (degrees): Roll angle oscillation amplitude at release
+   - Calculated as (max - min) roll angle over 10-frame release window ÷ 2
+   - Typical range: 2-10° for stable throws
+   - Indicator of release quality and disc stability
 
 **See [SIX_PARAMETERS.md](../../SIX_PARAMETERS.md) for detailed physics, formulas, and interpretation.**
   - Smaller amplitude = more stable flight
@@ -307,6 +308,21 @@ Run: `pip install -r requirements.txt`
 - Frame rate-aware calculations throughout
 - NaN values handled for tracking gaps
 - QTM connection optional—works standalone with demo data
+- **Velocity and trajectory calculations**: Uses **Mid marker** position from marker trajectories for robust velocity and position analysis
+  - More reliable than 6DOF rigid body center of mass (which is calculated from all markers)
+  - Direct measurement from single marker reduces noise and filtering artifacts
+  - Falls back to 6DOF body position if marker data unavailable
+- **Orientation calculations**: Uses 6DOF rotation matrices for all angle measurements (hyzer, nose, wobble)
+  - Provides accurate disc orientation throughout flight
+  - Essential for spin-invariant angle calculations
+- **Release point detection**: Automatically identifies disc release using velocity analysis
+  - Finds first velocity peak within valid range (3-40 m/s)
+  - Verifies acceleration phase precedes release
+  - Ensures accurate parameter measurement at true release moment
+- **Net impact detection**: Automatically detects and excludes post-impact data when disc hits net
+  - Identifies first frame after release where velocity drops below 50% of release velocity
+  - Only analyzes flight data up to impact point
+  - Ensures clean release parameters without net collision artifacts
 
 ## Performance
 
